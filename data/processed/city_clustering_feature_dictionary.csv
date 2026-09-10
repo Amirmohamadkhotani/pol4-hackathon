@@ -1,0 +1,20 @@
+﻿feature,family,use_in_cluster_v1,description
+completion_D30,completion,1,Historical fraction of city demand accumulated by D-30.
+completion_D21,completion,1,Historical fraction accumulated by D-21.
+completion_D14,completion,1,Historical fraction accumulated by D-14.
+completion_D7,completion,1,Historical fraction accumulated by D-7.
+completion_D3,completion,1,Historical fraction accumulated by D-3.
+completion_D1,completion,1,Historical fraction accumulated by D-1.
+log_total_searches,city_size,1,log(1 + total historical city search volume).
+log_recent_90_total,city_size,1,log(1 + city final demand over last 90 completed check-in days).
+recent_90_share_platform,city_size,1,City share of platform demand over recent 90 days.
+log_recent_growth_90,trend,1,Log demand growth: recent 90 days versus previous 90 days.
+positive_checkin_rate,support,1,Share of city active-span dates with positive final demand.
+weekday_index_*,calendar_behavior,1,Mean city demand for weekday divided by city's overall daily mean.
+weekend_index_365,calendar_behavior,1,Mean Thu/Fri demand relative to city's overall daily mean.
+holiday_index_365,calendar_behavior,1,Mean official-holiday demand relative to city's overall daily mean.
+demand_cv_365,volatility,1,Coefficient of variation of daily city demand over trailing 365 days.
+city_reliability,data_quality,0,"reliable / sparse / one_off_anomaly / cold_start. FILTER, not a clustering dimension."
+fit_eligible,data_quality,0,1 only for reliable cities. Recommended rows used to FIT clustering.
+city_code,identifier,0,City identifier. Never use as numeric clustering input.
+snapshot_cutoff,validation,0,Historical information cutoff used to construct the row.
