@@ -17,7 +17,9 @@ def calculate_wape(actual, predicted):
     actual = np.array(actual, dtype=float)
     predicted = np.array(predicted, dtype=float)
     denom = np.sum(actual)
-    return np.sum(np.abs(predicted - actual)) / denom if denom > 0 else 0.0
+    if denom == 0:
+        raise ValueError("WAPE denominator is zero")
+    return np.sum(np.abs(predicted - actual)) / denom
 
 
 print("در حال بارگذاری داده‌ها برای Clustering V2...")
@@ -34,10 +36,17 @@ search_df['dow'] = search_df['checkin'].dt.dayofweek
 snapshots_df = pd.read_csv(PATH_SNAPSHOTS)
 snapshots_df['snapshot_cutoff'] = pd.to_datetime(snapshots_df['snapshot_cutoff'])
 all_cutoffs = sorted(snapshots_df['snapshot_cutoff'].unique())
+COMPETITION_CUTOFF = pd.Timestamp('2025-11-21')
+EXPECTED_CITIES = 321
+EXPECTED_EVAL_ROWS = EXPECTED_CITIES * 30
 
 # 🛑 اصلاح باگ ۱: فیلتر کات‌آف‌هایی که ۳۰ روز کامل لیبل آینده در search_df دارند (حذف کات‌آف مسابقه از بک‌تست)
 max_search_checkin = search_df['checkin'].max()
-available_cutoffs = [c for c in all_cutoffs if pd.to_datetime(c) + pd.Timedelta(days=30) <= max_search_checkin]
+available_cutoffs = [
+    c for c in all_cutoffs
+    if pd.to_datetime(c) != COMPETITION_CUTOFF
+    and pd.to_datetime(c) + pd.Timedelta(days=30) <= max_search_checkin
+]
 
 print(f"کل کات‌آف‌های اسنپ‌شات: {len(all_cutoffs)} | کات‌آف‌های معتبر برای بک‌تست (دارای لیبل ۳۰ روزه): {len(available_cutoffs)}")
 
@@ -53,6 +62,9 @@ v2_features = [
 # 2. منطق Clustering V2 (دو مرحله‌ای: Tiering حجمی + Shape Clustering)
 # ============================================================
 def fit_clustering_v2(snap_df):
+    snapshot_cities = {int(c) for c in snap_df['city_code']}
+    assert len(snap_df) == EXPECTED_CITIES, f"Expected 321 snapshot rows, got {len(snap_df)}"
+    assert len(snapshot_cities) == EXPECTED_CITIES, f"Expected 321 unique cities, got {len(snapshot_cities)}"
     fit_mask = snap_df['fit_eligible'] == 1
     train_cities = snap_df[fit_mask].copy()
     all_cities = snap_df.copy()
@@ -98,7 +110,17 @@ def fit_clustering_v2(snap_df):
             cluster_map[c] = cluster_id_counter + p
         cluster_id_counter += k_sub
 
-    return all_cities['city_code'].map(cluster_map).fillna(0).astype(int).to_dict()
+    result = {
+        int(city_code): int(cluster_id)
+        for city_code, cluster_id in cluster_map.items()
+    }
+    assert len(result) == EXPECTED_CITIES, f"Expected 321 mappings, got {len(result)}"
+    assert set(result) == snapshot_cities, "Mapping keys do not match snapshot city_code values"
+    missing_valid_cities = snapshot_cities - set(result)
+    assert not missing_valid_cities, f"Missing valid city mappings: {sorted(missing_valid_cities)}"
+    missing_key_fallbacks = sum(city not in result for city in snapshot_cities)
+    assert missing_key_fallbacks == 0, "Valid cities would be assigned through a missing-key fallback"
+    return result
 
 
 # ============================================================
@@ -106,7 +128,9 @@ def fit_clustering_v2(snap_df):
 # ============================================================
 def compute_curves(hist_search_df, city_to_cluster):
     df = hist_search_df.copy()
-    df['cluster'] = df['city_code'].map(city_to_cluster).fillna(-1).astype(int)
+    valid_rows = df['city_code'].isin(city_to_cluster)
+    df = df[valid_rows].copy()
+    df['cluster'] = df['city_code'].map(city_to_cluster).astype(int)
 
     tot_global = df['search_count'].sum()
     tot_cluster = df.groupby('cluster')['search_count'].sum().to_dict()
@@ -124,27 +148,30 @@ def compute_curves(hist_search_df, city_to_cluster):
     lt_cluster = df.groupby(['cluster', 'lead_time'])['search_count'].sum().reset_index()
     lt_global = df.groupby('lead_time')['search_count'].sum().reset_index()
 
-    global_rates = {}
-    g_cum = 0
-    for lt in sorted(lt_global['lead_time'].unique(), reverse=True):
-        g_cum += lt_global.loc[lt_global['lead_time'] == lt, 'search_count'].values[0]
-        global_rates[lt] = g_cum / tot_global if tot_global > 0 else 1.0
+    lead_grid = range(60)
+
+    def full_completion_curve(lead_totals, denominator):
+        by_lead = lead_totals.set_index('lead_time')['search_count']
+        # Include volume beyond day 59 in every applicable cumulative numerator,
+        # while explicitly representing missing h=0..59 volume as zero.
+        beyond_59 = float(by_lead[by_lead.index > 59].sum())
+        grid_volume = by_lead.reindex(lead_grid, fill_value=0.0).astype(float)
+        cumulative = grid_volume.iloc[::-1].cumsum().iloc[::-1] + beyond_59
+        if denominator <= 0:
+            return {h: 1.0 for h in lead_grid}
+        return {int(h): float(cumulative.loc[h] / denominator) for h in lead_grid}
+
+    global_rates = full_completion_curve(lt_global, tot_global)
 
     cluster_rates = {c: {} for c in tot_cluster}
     for c in tot_cluster:
         sub = lt_cluster[lt_cluster['cluster'] == c]
-        c_cum = 0
-        for lt in sorted(sub['lead_time'].unique(), reverse=True):
-            c_cum += sub.loc[sub['lead_time'] == lt, 'search_count'].values[0]
-            cluster_rates[c][lt] = c_cum / tot_cluster[c] if tot_cluster[c] > 0 else 1.0
+        cluster_rates[c] = full_completion_curve(sub, tot_cluster[c])
 
     city_rates = {c: {} for c in tot_city if tot_city[c] >= 1500}
     for c in city_rates:
         sub = lt_city[lt_city['city_code'] == c]
-        c_cum = 0
-        for lt in sorted(sub['lead_time'].unique(), reverse=True):
-            c_cum += sub.loc[sub['lead_time'] == lt, 'search_count'].values[0]
-            city_rates[c][lt] = c_cum / tot_city[c]
+        city_rates[c] = full_completion_curve(sub, tot_city[c])
 
     return city_rates, cluster_rates, global_rates, city_priors, dow_dict, tot_city
 
@@ -214,7 +241,9 @@ def prepare_backtest_data_v2():
         snap = snapshots_df[snapshots_df['snapshot_cutoff'] == cutoff].copy()
 
         city_to_cluster = fit_clustering_v2(snap)
-        active_cities = snap['city_code'].unique()
+        active_cities = snap['city_code'].astype(int).unique()
+        assert len(active_cities) == EXPECTED_CITIES
+        assert set(city_to_cluster) == set(active_cities)
 
         hist_data = search_df[search_df['checkin'] <= cutoff_dt].copy()
         target_dates = pd.date_range(cutoff_dt + pd.Timedelta(days=1), periods=30)
@@ -232,6 +261,8 @@ def prepare_backtest_data_v2():
 
         eval_df = pd.merge(full_grid, actual_test, on=['city_code', 'checkin'], how='left').fillna({'actual': 0})
         eval_df = pd.merge(eval_df, observed_demand, on=['city_code', 'checkin'], how='left').fillna({'obs': 0})
+        assert len(eval_df) == EXPECTED_EVAL_ROWS, f"Expected 9,630 rows, got {len(eval_df)} at {cutoff_dt.date()}"
+        assert eval_df[['actual', 'obs']].notna().all().all(), f"Missing demand values at {cutoff_dt.date()}"
         
         eval_df['h'] = (eval_df['checkin'] - cutoff_dt).dt.days
         eval_df['dow'] = eval_df['checkin'].dt.dayofweek
@@ -242,6 +273,8 @@ def prepare_backtest_data_v2():
         city_caps_raw, cluster_caps_raw, global_cap_raw = compute_demand_caps_raw(hist_data, city_to_cluster)
 
         prepared.append(dict(
+            cutoff=cutoff_dt,
+            rows=len(eval_df),
             eval_rows=list(eval_df[['city_code', 'h', 'obs', 'dow']].itertuples(index=False)),
             actual=eval_df['actual'].to_numpy(),
             h_arr=eval_df['h'].to_numpy(),
@@ -280,7 +313,7 @@ def score_config(prepared, use_cluster=True, base_lambda=0.015, horizon_scale=0.
             h = min(int(row.h), 59)
             obs = row.obs
             d = int(row.dow)
-            c_id = city_to_cluster.get(c_code, -1)
+            c_id = city_to_cluster[c_code]
 
             prior = city_priors.get(c_code, 0.0)
             dow_mult = dow_dict.get((c_code, d), 1.0)
@@ -309,7 +342,13 @@ def score_config(prepared, use_cluster=True, base_lambda=0.015, horizon_scale=0.
             pred_raw = (obs + lam * prior_adj) / (rate + lam)
 
             if use_caps:
-                cap = city_caps_raw.get(c_code, cluster_caps_raw.get(c_id, global_cap_raw)) * cap_headroom
+                if c_code in city_caps_raw:
+                    raw_cap = city_caps_raw[c_code]
+                elif use_cluster and c_id in cluster_caps_raw:
+                    raw_cap = cluster_caps_raw[c_id]
+                else:
+                    raw_cap = global_cap_raw
+                cap = raw_cap * cap_headroom
                 upper_bound = max(cap, obs)
             else:
                 upper_bound = np.inf
@@ -329,7 +368,147 @@ def score_config(prepared, use_cluster=True, base_lambda=0.015, horizon_scale=0.
     return np.mean(cutoff_wapes), np.median(cutoff_wapes), np.mean(h1_list), np.mean(h2_list), np.mean(h3_list)
 
 
+def predict_bundle(bundle, use_cluster):
+    """Run the fixed model, changing only cluster fallback availability."""
+    city_rates = bundle['city_rates']
+    cluster_rates = bundle['cluster_rates']
+    global_rates = bundle['global_rates']
+    preds = []
+    for row in bundle['eval_rows']:
+        city = int(row.city_code)
+        h = min(int(row.h), 59)
+        cluster = bundle['city_to_cluster'][city]
+        rate = city_rates.get(city, {}).get(h)
+        if use_cluster and (rate is None or rate <= 0.002):
+            rate = cluster_rates.get(cluster, {}).get(h)
+        if rate is None or rate <= 0.002:
+            rate = global_rates[h]
+        rate = max(rate, 0.005)
+
+        prior = bundle['city_priors'].get(city, 0.0)
+        dow_mult = bundle['dow_dict'].get((city, int(row.dow)), 1.0)
+        mom_raw = bundle['momentum_raw'].get(city, bundle['global_momentum_raw'])
+        prior_adj = prior * dow_mult * apply_momentum(mom_raw, 0.6)
+        lam = compute_dynamic_lambda(h, bundle['tier_mult'].get(city, 1.0), 0.015, 0.10, 1.6)
+        pred_raw = (row.obs + lam * prior_adj) / (rate + lam)
+
+        if city in bundle['city_caps_raw']:
+            raw_cap = bundle['city_caps_raw'][city]
+        elif use_cluster and cluster in bundle['cluster_caps_raw']:
+            raw_cap = bundle['cluster_caps_raw'][cluster]
+        else:
+            raw_cap = bundle['global_cap_raw']
+        upper_bound = max(raw_cap * 1.35, row.obs)
+        preds.append(min(max(pred_raw, row.obs), upper_bound))
+    return np.asarray(preds)
+
+
+def evaluate_cluster_ablation(prepared):
+    results = []
+    for bundle in prepared:
+        actual = bundle['actual']
+        pred_with = predict_bundle(bundle, True)
+        pred_without = predict_bundle(bundle, False)
+        with_wape = calculate_wape(actual, pred_with)
+        without_wape = calculate_wape(actual, pred_without)
+        results.append({
+            'cutoff': bundle['cutoff'].date().isoformat(),
+            'rows': bundle['rows'],
+            'actual_total': float(actual.sum()),
+            'WAPE_with_cluster': with_wape,
+            'WAPE_without_cluster': without_wape,
+            'delta_WAPE': without_wape - with_wape,
+            'abs_error_with_cluster': float(np.abs(pred_with - actual).sum()),
+            'abs_error_without_cluster': float(np.abs(pred_without - actual).sum()),
+        })
+    return pd.DataFrame(results)
+
+
+def cluster_distribution(mapping):
+    counts = pd.Series(mapping).value_counts().sort_index()
+    return pd.DataFrame({
+        'cluster_id': counts.index.astype(int),
+        'number_of_cities': counts.values.astype(int),
+        'share': counts.values / EXPECTED_CITIES,
+    })
+
+
+def run_end_to_end():
+    failures = []
+    print("\nA. VALIDATION CHECKS")
+    snapshot_mappings = {}
+    for cutoff in all_cutoffs:
+        snap = snapshots_df[snapshots_df['snapshot_cutoff'] == cutoff].copy()
+        mapping = fit_clustering_v2(snap)
+        snapshot_mappings[pd.Timestamp(cutoff)] = mapping
+        print(f"PASS {pd.Timestamp(cutoff).date()}: 321 cities, 321 exact mappings, 0 missing/fallback mappings")
+    assert COMPETITION_CUTOFF not in {pd.Timestamp(c) for c in available_cutoffs}
+    print(f"PASS competition cutoff {COMPETITION_CUTOFF.date()} excluded from backtest")
+
+    prepared_v2 = prepare_backtest_data_v2()
+    assert all(bundle['rows'] == EXPECTED_EVAL_ROWS for bundle in prepared_v2)
+    print(f"PASS {len(prepared_v2)} historical cutoffs each contain exactly 9,630 evaluation rows")
+    print("PASS missing actual and observed demand filled with zero")
+    try:
+        calculate_wape([0, 0], [0, 1])
+        failures.append("calculate_wape did not reject a zero denominator")
+    except ValueError as exc:
+        assert str(exc) == "WAPE denominator is zero"
+        print("PASS zero WAPE denominator raises the required ValueError")
+
+    ablation = evaluate_cluster_ablation(prepared_v2)
+    print("\nB. PER-CUTOFF WITH vs WITHOUT")
+    print(ablation.to_string(index=False, formatters={
+        'WAPE_with_cluster': '{:.6%}'.format,
+        'WAPE_without_cluster': '{:.6%}'.format,
+        'delta_WAPE': '{:+.6%}'.format,
+        'actual_total': '{:.0f}'.format,
+        'abs_error_with_cluster': '{:.3f}'.format,
+        'abs_error_without_cluster': '{:.3f}'.format,
+    }))
+
+    pooled_with = ablation['abs_error_with_cluster'].sum() / ablation['actual_total'].sum()
+    pooled_without = ablation['abs_error_without_cluster'].sum() / ablation['actual_total'].sum()
+    wins = int((ablation['delta_WAPE'] > 0).sum())
+    losses = int((ablation['delta_WAPE'] < 0).sum())
+    print("\nC. POOLED ABLATION")
+    print(f"WITH clustering    mean={ablation['WAPE_with_cluster'].mean():.6%} median={ablation['WAPE_with_cluster'].median():.6%} pooled={pooled_with:.6%}")
+    print(f"WITHOUT clustering mean={ablation['WAPE_without_cluster'].mean():.6%} median={ablation['WAPE_without_cluster'].median():.6%} pooled={pooled_without:.6%}")
+    print(f"Pooled improvement={(pooled_without - pooled_with) * 100:+.6f} percentage points")
+    print(f"Cutoffs won/lost={wins}/{losses}")
+    print(f"Worst degradation={ablation['delta_WAPE'].min() * 100:+.6f} percentage points")
+    print(f"Best improvement={ablation['delta_WAPE'].max() * 100:+.6f} percentage points")
+
+    print("\nD. FINAL CLUSTER DISTRIBUTION")
+    for cutoff in all_cutoffs:
+        label = "FINAL" if pd.Timestamp(cutoff) == COMPETITION_CUTOFF else "HISTORICAL"
+        print(f"\n{label} {pd.Timestamp(cutoff).date()}")
+        print(cluster_distribution(snapshot_mappings[pd.Timestamp(cutoff)]).to_string(index=False, formatters={'share': '{:.6%}'.format}))
+
+    final_mapping = snapshot_mappings[COMPETITION_CUTOFF]
+    final_dist = cluster_distribution(final_mapping)
+    print(f"\nnumber of clusters={len(final_dist)}")
+    print(f"min cluster size={final_dist['number_of_cities'].min()}")
+    print(f"max cluster size={final_dist['number_of_cities'].max()}")
+    print(f"largest cluster share={final_dist['share'].max():.6%}")
+    print(f"singleton clusters={(final_dist['number_of_cities'] == 1).sum()}")
+
+    final_snap = snapshots_df[snapshots_df['snapshot_cutoff'] == COMPETITION_CUTOFF]
+    final_df = pd.DataFrame(sorted(final_mapping.items()), columns=['city_code', 'cluster_v2'])
+    assert set(final_df['city_code']) == set(final_snap['city_code'].astype(int))
+    assert final_df['city_code'].is_monotonic_increasing
+    output_path = ROOT / "data" / "processed" / "final_city_clusters_v2.csv"
+    final_df.to_csv(output_path, index=False)
+    print(f"PASS regenerated {output_path} with actual sorted city codes")
+    print("\nE. Any failures")
+    print("None" if not failures else "\n".join(failures))
+
+
 if __name__ == "__main__":
+    run_end_to_end()
+
+
+if __name__ == "__legacy_main__":
     print("\n" + "=" * 60)
     print("ارزیابی معتبر Clustering V2 (با گرید کامل و بدون لیک‌اژ کات‌آف)")
     print("=" * 60)
